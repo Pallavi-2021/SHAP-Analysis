@@ -1196,15 +1196,66 @@ elif page == "SHAP Analysis":
         import shap
 
         with st.spinner("Computing SHAP values..."):
-            X_test_df   = pd.DataFrame(X_test, columns=feature_names)
-            X_train_df  = pd.DataFrame(scaler.transform(X_train), columns=feature_names)
-            X_test_sc   = pd.DataFrame(scaler.transform(X_test),  columns=feature_names)
-            explainer   = shap.Explainer(model, X_train_df)
-            shap_values = explainer(X_test_sc, check_additivity=False)
+            X_train_df = pd.DataFrame(scaler.transform(X_train), columns=feature_names)
+            X_test_sc  = pd.DataFrame(scaler.transform(X_test),  columns=feature_names)
+
+            # ── Safe explainer selection ──────────────────────────────────────
+            # shap.Explainer auto-routes to TreeExplainer for tree models, which
+            # segfaults on NumPy 2.x with RandomForest on Streamlit Cloud.
+            # We explicitly use LinearExplainer for linear models and a safe
+            # sampling-based KernelExplainer subset for tree ensembles, with
+            # TreeExplainer only when it is known to be safe (single-output GB).
+            from sklearn.ensemble import (
+                GradientBoostingClassifier, GradientBoostingRegressor,
+                RandomForestClassifier, RandomForestRegressor,
+            )
+            from sklearn.linear_model import Ridge, LogisticRegression
+
+            shap_values = None
+            explainer   = None
+
+            if isinstance(model, (GradientBoostingClassifier, GradientBoostingRegressor)):
+                # GB is single-output and safe with TreeExplainer
+                explainer   = shap.TreeExplainer(model, X_train_df)
+                shap_values = explainer(X_test_sc, check_additivity=False)
+
+            elif isinstance(model, (RandomForestClassifier, RandomForestRegressor)):
+                # RandomForest multi-output TreeExplainer segfaults on NumPy 2.x.
+                # Use a 100-row background sample + KernelExplainer (safe everywhere).
+                bg = shap.sample(X_train_df, min(100, len(X_train_df)))
+                explainer   = shap.KernelExplainer(model.predict, bg)
+                # Limit to 200 test rows so it completes in reasonable time
+                X_test_sub  = X_test_sc.iloc[:min(200, len(X_test_sc))]
+                raw_vals    = explainer.shap_values(X_test_sub, silent=True)
+                # KernelExplainer returns ndarray; wrap into Explanation object
+                shap_values = shap.Explanation(
+                    values      = np.array(raw_vals),
+                    base_values = np.full(len(X_test_sub), explainer.expected_value
+                                          if np.isscalar(explainer.expected_value)
+                                          else explainer.expected_value[0]),
+                    data        = X_test_sub.values,
+                    feature_names = feature_names,
+                )
+                X_test_sc = X_test_sub   # align downstream to the subset used
+
+            elif isinstance(model, (Ridge, LogisticRegression)):
+                explainer   = shap.LinearExplainer(model, X_train_df)
+                shap_values = explainer(X_test_sc)
+
+            else:
+                # Generic fallback: masker-based Explainer, catches everything else
+                masker      = shap.maskers.Independent(X_train_df, max_samples=100)
+                explainer   = shap.Explainer(model.predict, masker)
+                shap_values = explainer(X_test_sc.iloc[:200])
+                X_test_sc   = X_test_sc.iloc[:200]
 
         # ── SHAP 1: Bar Summary ───────────────────────────────────────────────
         st.markdown("**Global Feature Impact — Mean Absolute SHAP Values**")
-        mean_shap = np.abs(shap_values.values).mean(axis=0)
+        sv_array  = np.array(shap_values.values)
+        # Handle 3-D output (some explainers return [samples, features, classes])
+        if sv_array.ndim == 3:
+            sv_array = sv_array[:, :, 1] if sv_array.shape[2] == 2 else sv_array.mean(axis=2)
+        mean_shap = np.abs(sv_array).mean(axis=0)
         shap_df   = pd.Series(mean_shap, index=feature_names).sort_values(ascending=False).head(15)
 
         fig, ax = styled_fig((10, 5))
@@ -1216,13 +1267,13 @@ elif page == "SHAP Analysis":
         fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
-        chart_caption("Each bar shows the average impact of that feature on the model's output, across all records. The feature at the top has the largest influence on the predicted value. This view treats all records equally and provides the overall driver ranking.")
+        chart_caption("Each bar shows the average impact of that feature on the model's output, across all records. The feature at the top has the largest influence on the predicted value.")
 
-        # ── SHAP 2: Beeswarm (via matplotlib scatter proxy) ───────────────────
+        # ── SHAP 2: Beeswarm ─────────────────────────────────────────────────
         st.markdown("<br>**SHAP Value Spread Across Records (Top 10 Features)**")
         top10 = shap_df.head(10).index.tolist()
         idx   = [feature_names.index(f) for f in top10]
-        sv    = shap_values.values[:, idx]
+        sv    = sv_array[:, idx]
         fv    = X_test_sc[top10].values
 
         fig, ax = styled_fig((11, 6))
@@ -1230,7 +1281,9 @@ elif page == "SHAP Analysis":
             col_idx = len(top10) - 1 - i
             s_vals  = sv[:, col_idx]
             f_vals  = fv[:, col_idx]
-            norm_fv = (f_vals - f_vals.min()) / (f_vals.ptp() + 1e-9)
+            # ptp() removed in NumPy 2.0 — use max-min instead
+            f_range = (f_vals.max() - f_vals.min()) + 1e-9
+            norm_fv  = (f_vals - f_vals.min()) / f_range
             colors_s = plt.cm.RdBu_r(norm_fv)
             jitter   = np.random.uniform(-0.2, 0.2, len(s_vals))
             ax.scatter(s_vals, np.full_like(s_vals, i) + jitter,
@@ -1239,11 +1292,10 @@ elif page == "SHAP Analysis":
         ax.set_yticks(range(len(top10)))
         ax.set_yticklabels(top10[::-1], fontsize=9)
         ax.axvline(0, color="#888", linewidth=0.8, linestyle="--")
-        style_ax(ax, "SHAP Value Distribution Per Feature (Beeswarm)", "SHAP Value (Impact on Prediction)", "Feature")
+        style_ax(ax, "SHAP Value Distribution Per Feature (Beeswarm)",
+                 "SHAP Value (Impact on Prediction)", "Feature")
         ax.grid(axis="x", color="#E8E4DC", linewidth=0.5, linestyle="--")
         ax.set_axisbelow(True)
-
-        # Colour legend
         sm = plt.cm.ScalarMappable(cmap="RdBu_r", norm=plt.Normalize(0, 1))
         sm.set_array([])
         cb = fig.colorbar(sm, ax=ax, pad=0.02, aspect=30)
@@ -1252,13 +1304,13 @@ elif page == "SHAP Analysis":
         fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
-        chart_caption("Each dot represents one visit record. Dots to the right of the centre line increase the prediction; dots to the left decrease it. The colour indicates whether the feature value was low (blue) or high (red) for that record, revealing whether high or low values of each feature tend to drive sales up or down.")
+        chart_caption("Each dot represents one visit record. Dots to the right increase the prediction; dots to the left decrease it. Colour shows whether the feature value was low (blue) or high (red).")
 
-        # ── SHAP 3: Dependence Plot for top feature ───────────────────────────
-        top_feat    = shap_df.index[0]
-        top_feat_i  = feature_names.index(top_feat)
-        feat_vals   = X_test_sc[top_feat].values
-        shap_top    = shap_values.values[:, top_feat_i]
+        # ── SHAP 3: Dependence Plot ───────────────────────────────────────────
+        top_feat   = shap_df.index[0]
+        top_feat_i = feature_names.index(top_feat)
+        feat_vals  = X_test_sc[top_feat].values
+        shap_top   = sv_array[:, top_feat_i]
 
         st.markdown(f"<br>**Dependency Plot — {top_feat}**")
         fig, ax = styled_fig((10, 4.5))
@@ -1267,22 +1319,21 @@ elif page == "SHAP Analysis":
         ax.axhline(0, color="#888", linewidth=0.8, linestyle="--")
         z = np.polyfit(feat_vals, shap_top, 1)
         xline = np.linspace(feat_vals.min(), feat_vals.max(), 100)
-        ax.plot(xline, np.poly1d(z)(xline), color=PALETTE[2], linewidth=1.8, linestyle="-")
+        ax.plot(xline, np.poly1d(z)(xline), color=PALETTE[2], linewidth=1.8)
         style_ax(ax, f"SHAP Dependency: Effect of {top_feat} on Prediction",
-                 f"{top_feat} (Scaled)", "SHAP Value (Contribution to Prediction)")
+                 f"{top_feat} (Scaled)", "SHAP Value")
         cb = fig.colorbar(sc, ax=ax, pad=0.02)
         cb.set_label(top_feat, fontsize=8.5)
         cb.ax.tick_params(labelsize=8)
         fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
-        chart_caption(f"This scatter plot shows how {top_feat} — the most impactful feature — affects predictions across all records. Each dot is one visit. The trend line (orange) shows the overall direction: whether higher values of {top_feat} tend to increase or decrease the predicted outcome.")
+        chart_caption(f"How {top_feat} — the most impactful feature — affects predictions. The trend line shows whether higher values tend to increase or decrease the predicted outcome.")
 
-        # ── SHAP 4: Waterfall for single record ───────────────────────────────
+        # ── SHAP 4: Waterfall ─────────────────────────────────────────────────
         st.markdown("<br>**Single Record Explanation (First Test Record)**")
-        rec_idx = 0
-        sv_rec  = shap_values.values[rec_idx]
-        base    = float(shap_values.base_values[rec_idx]) if hasattr(shap_values, "base_values") else 0.0
+        sv_rec = sv_array[0]
+        base   = float(shap_values.base_values[0]) if hasattr(shap_values, "base_values") else 0.0
 
         top_n    = 12
         order    = np.argsort(np.abs(sv_rec))[::-1][:top_n]
@@ -1296,35 +1347,44 @@ elif page == "SHAP Analysis":
         ax.axvline(0, color="#555", linewidth=0.9)
         style_ax(ax, "SHAP Waterfall — Top Contributing Features (Record 1)",
                  "SHAP Value (Impact on Prediction)", "Feature")
-        ax.set_xlim(min(vals_wf.min() * 1.15, -0.01), vals_wf.max() * 1.15)
-
+        x_min = min(vals_wf.min() * 1.15, -0.01) if vals_wf.min() < 0 else -0.01
+        ax.set_xlim(x_min, vals_wf.max() * 1.15 if vals_wf.max() > 0 else 0.01)
         pos_patch = mpatches.Patch(color=PALETTE[0], label="Increases prediction")
         neg_patch = mpatches.Patch(color="#B03A2E",  label="Decreases prediction")
         ax.legend(handles=[pos_patch, neg_patch], fontsize=8.5, loc="lower right")
         fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
-        chart_caption(f"This waterfall chart explains the prediction for one specific visit record. Blue bars represent features that pushed the prediction higher; red bars pushed it lower. The base value (model average) was {base:.2f}. This view helps answer: 'Why did the model predict this particular outcome for this record?'")
+        chart_caption(f"Why the model made this specific prediction. Blue = pushed higher, Red = pushed lower. Base value: {base:.4f}.")
 
-    except ImportError:
-        st.markdown("""
+    except Exception as shap_err:
+        # Broad catch: covers ImportError, segfault survivors, version mismatches,
+        # value errors, and anything else that can go wrong with SHAP.
+        st.markdown(f"""
         <div class="warn-box">
-        <strong>SHAP library not installed.</strong><br>
-        Run <code>pip install shap</code> in your environment to enable SHAP visualisations.
-        The model has been trained successfully and all other sections remain functional.
+        <strong>SHAP computation could not complete.</strong><br>
+        Reason: <code>{type(shap_err).__name__}: {shap_err}</code><br><br>
+        Showing built-in feature importance instead — all other dashboard pages
+        remain fully functional.
         </div>
         """, unsafe_allow_html=True)
 
-        # Fallback: show built-in feature importance
-        st.markdown("**Feature Importance (Built-in) — Available Without SHAP**")
-        fi = pd.Series(model.feature_importances_, index=feature_names).sort_values(ascending=False).head(15)
-        fig, ax = styled_fig((10, 5))
-        ax.barh(fi.index[::-1], fi.values[::-1], color=PALETTE[1], edgecolor="none", height=0.6)
-        style_ax(ax, "Feature Importance (Top 15)", "Importance Score", "Feature")
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-        chart_caption("This chart shows the model's internal feature importance scores — a proxy for SHAP when the SHAP library is unavailable. Install SHAP for richer, per-prediction explanations.")
+        # ── Fallback: built-in feature importance (always works) ─────────────
+        st.markdown("**Feature Importance (Built-in Model Scores)**")
+        try:
+            fi = pd.Series(
+                model.feature_importances_, index=feature_names
+            ).sort_values(ascending=False).head(15)
+            fig, ax = styled_fig((10, 5))
+            ax.barh(fi.index[::-1], fi.values[::-1], color=PALETTE[1],
+                    edgecolor="none", height=0.6)
+            style_ax(ax, "Feature Importance (Top 15)", "Importance Score", "Feature")
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+            chart_caption("Built-in feature importance scores from the trained model. These reflect how often each feature was used in splits and how much it reduced error — a reliable proxy when SHAP is unavailable.")
+        except AttributeError:
+            st.info("This model type does not expose built-in feature importances.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1757,7 +1817,7 @@ elif page == "AI Assistant":
     # ── API Key — INSERT YOUR KEY BELOW ──────────────────────────────────────
     # Replace the empty string with your Google Gemini API key, e.g.:
     #   GEMINI_API_KEY = "AIzaSy..."
-       # <-- INSERT YOUR GEMINI API KEY HERE
+   # <-- INSERT YOUR GEMINI API KEY HERE
     # ─────────────────────────────────────────────────────────────────────────
     GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "") 
 
