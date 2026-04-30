@@ -1757,7 +1757,7 @@ elif page == "AI Assistant":
     # ── API Key — INSERT YOUR KEY BELOW ──────────────────────────────────────
     # Replace the empty string with your Google Gemini API key, e.g.:
     #   GEMINI_API_KEY = "AIzaSy..."
-    GEMINI_API_KEY = "AIzaSyDCFsO0-1H-m4vturYyTzwSSyq3voakorQ"   # <-- INSERT YOUR GEMINI API KEY HERE
+       # <-- INSERT YOUR GEMINI API KEY HERE
     # ─────────────────────────────────────────────────────────────────────────
     GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "") 
 
